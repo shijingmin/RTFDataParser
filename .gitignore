@@ -1,0 +1,53 @@
+# ----------------------
+# Python 项目通用忽略规则
+# ----------------------
+
+# 字节码和缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+venv/
+.env/
+env/
+ENV/
+
+# 日志和数据库文件
+*.log
+*.sqlite
+*.db
+
+# 单元测试/覆盖率报告
+.coverage
+htmlcov/
+.pytest_cache/
+
+# 打包产物
+dist/
+build/
+*.egg-info/
+*.egg
+*.whl
+*.rar
+
+# IDE 配置文件
+.vscode/
+.idea/
+.DS_Store (Mac)
+
+# 本地环境变量文件
+.env
+.env.local
+secrets.yml
+
+# 临时文件
+*.tmp
+*.bak
+
+# 其他
+.ipynb_checkpoints/
+
+# dir
+数据测试用PSG data/
+unittest/testdata
