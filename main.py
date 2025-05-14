@@ -176,7 +176,7 @@ class AppUI:
             # 强制刷新界面
             self.root.update_idletasks()
             self.root.title("RTF解析工具")
-            self.logger.log("INFO", "界面状态已恢复")
+            self.logger.log("INFO", "界面状态已恢复，可以解析下一组文件")
 
         except Exception as e:
             self.logger.log("ERROR", f"状态恢复失败: {str(e)}")

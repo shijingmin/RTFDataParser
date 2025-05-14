@@ -2,24 +2,14 @@ import os
 import yaml
 import subprocess
 from docx import Document
-from docx.oxml import CT_P, CT_Tbl
-from docx.text.paragraph import Paragraph
-from docx.table import Table
 from openpyxl import Workbook
-from openpyxl.utils import get_column_letter
 from docx.oxml import OxmlElement
 import enum
 import re
-import logging
-from logging.handlers import RotatingFileHandler
-import sys
-from collections import defaultdict
-
-from pandas.io.sas.sas_constants import column_name_text_subheader_length
+from collections import OrderedDict
 
 # 配置文件路径
-YAML_CONFIG = "Apnea2.yml"
-
+YAML_CONFIG = "MedicalReportParameters.yml"
 
 class tableType(enum.Enum):
     Null = enum.auto()
@@ -33,6 +23,23 @@ class tableType(enum.Enum):
     BreathingEvent = enum.auto()
     OxygenSaturation = enum.auto()
     Snoring = enum.auto()
+
+def convert_time(time_str):
+    try:
+        if ":" in time_str:  # 处理类似"0:12:2.0"的格式
+            parts = list(map(float, time_str.split(":")))
+            return round(parts[0] * 60 + parts[1] + parts[2] / 60, 2)
+        return float(time_str)
+    except:
+        return None
+
+def extract_number(value):
+    try:
+        # 移除可能存在的百分号
+        cleaned = str(value).replace('%', '').strip()
+        return float(cleaned)
+    except:
+        return None
 
 class RtfDataParser:
     def __init__(self):
@@ -85,10 +92,10 @@ class RtfDataParser:
             tableType.BreathingEvent: re.compile(
                 r'\b(?:' + '|'.join([re.escape(kw).replace('\\', '\\\\') for kw in keyword_breathingEvent]) + r')\b',
                 re.IGNORECASE),
-            tableType.Special: re.compile(
+            tableType.Snoring: re.compile(
                 r'\b(?:' + '|'.join([re.escape(kw).replace('\\', '\\\\') for kw in keyword_snoring]) + r')\b',
                 re.IGNORECASE),
-            tableType.Mixed: re.compile(
+            tableType.OxygenSaturation: re.compile(
                 r'\b(?:' + '|'.join([re.escape(kw).replace('\\', '\\\\') for kw in keyword_oxygenSaturation]) + r')\b',
                 re.IGNORECASE),
         }
@@ -263,38 +270,156 @@ class RtfDataParser:
 
     def process_limbomovements_table(self,table, scan_mode=False):
         result = {}
+
+        # 列名标准化映射
         column_mapping = {
-            '睡眠期指数(/TST)': '睡眠期指数',
-            '睡眠期指数': '睡眠期指数'
+            "睡眠期指数(/TST)": "睡眠期指数(/TST)",
+            "睡眠期指数": "睡眠期指数(/TST)"
         }
+
+        # 结果容器（保持列顺序）
+
         # 标准化表头
-        headers = [column_mapping.get(col, col) for col in table[0]]
+        headers = [column_mapping.get(col.strip(), col.strip()) for col in table[0]]
 
         # 处理数据行
         for row in table[1:]:
-            event_type = row[0].strip()
-            # 清理特殊字符并生成列名
-            clean_type = event_type.replace("相关", "_").replace(" ", "")
-
+            # 清理类型名称
+            event_type = re.sub(r'\s+', '', row[0].strip())
             # 动态生成列名
-            count_col = f"{clean_type}_次数"
-            index_col = f"{clean_type}_指数"
+            count_col = f"{event_type}睡眠期次数"
+            index_col = f"{event_type}睡眠期指数(/TST)"
+            # 数据清洗（空值和-转为/）
+            count_value = row[1] if row[1] not in ['', '-'] else '/'
+            index_value = row[2] if row[2] not in ['', '-'] else '/'
 
-            # 存储数据（后续表格覆盖前期数据）
-            result[count_col] = row[1] if row[1] not in ['', '-'] else '/'
-            result[index_col] = row[2] if row[2] not in ['', '-'] else '/'
+            # 存储数据
+            result[count_col] = count_value
+            result[index_col] = index_value
+
         return result
 
     def process_breathingevent_table(self,table, scan_mode=False):
-        result = {}
+        """处理呼吸事件表格（完整保留所有体位数据）"""
+        # 预定义标准体位和指标
+        POSITIONS = ['俯卧', '左侧', '右侧', '仰卧']
+        METRICS = [
+            '阻塞性呼吸暂停', '混合性呼吸暂停', '中枢性呼吸暂停',
+            '低通气', 'AHI', '睡眠时间%', '持续时间(min)'
+        ]
+
+        # 初始化结果容器（动态扩展列）
+        result = OrderedDict()
+
+        # === 列名映射规则 ===
+        column_mapping = {
+            r'阻塞性[\s（]*': '阻塞性呼吸暂停',
+            r'混合性[\s（]*': '混合性呼吸暂停',
+            r'中枢性[\s（]*': '中枢性呼吸暂停',
+            r'低通气[\s（]*': '低通气',
+            r'^AHI$': 'AHI',
+            r'睡眠时间': '睡眠时间%',
+            r'持续时间[\s（]*min': '持续时间(min)'
+        }
+
+        # === 表头处理 ===
+        header_map = {}
+        for orig_col in table[0]:
+            # 深度清洗列名
+            cleaned_col = re.sub(r'[\n（）()]', '', orig_col).strip()
+            # 动态匹配列名规则
+            for pattern, mapped in column_mapping.items():
+                if re.search(pattern, cleaned_col):
+                    header_map[orig_col] = mapped
+                    break
+        # === 数据处理 ===
+        for row in table[1:]:
+            position = re.sub(r'\s+', '', row[0])
+            if position not in POSITIONS:
+                continue
+
+            for idx in range(1, len(row)):
+                orig_col = table[0][idx]
+                metric = header_map.get(orig_col)
+
+                if metric:
+                    # 生成完整列名
+                    col_name = f"{position}{metric}"
+                    raw_value = row[idx].strip()
+
+                    # 数据清洗
+                    if raw_value in ['', '-', 'NA']:
+                        final_value = '/'
+                    else:
+                        try:
+                            final_value = float(raw_value) if '.' in raw_value else int(raw_value)
+                        except:
+                            final_value = '/'
+
+                    # 直接存储所有值（包括0）
+                    result[col_name] = final_value
+
+        # === 补全所有可能的列 ===
+        full_columns = [f"{pos}{metric}" for pos in POSITIONS for metric in METRICS]
+        for col in full_columns:
+            if col not in result:
+                result[col] = '/'
+
+        # 保持列顺序
+        result = OrderedDict((col, result.get(col, '/')) for col in full_columns)
         return result
+
 
     def process_snoring_table(self,table, scan_mode=False):
         result = {}
+        for i in range(0, len(table[1]), 2):
+            key = table[1][i]
+            clean_key = re.sub(r'（睡眠期）', '', key)
+            value = table[1][i + 1]
+            result[clean_key] = value
         return result
+
 
     def process_oxygenSaturation_table(self,table, scan_mode=False):
         result = {}
+
+        for row in table:
+            # 处理前四个参数
+            for i, cell in enumerate(row):
+                if "睡眠期平均血氧 (%)" in cell:
+                    result["睡眠期平均血氧"] = extract_number(row[i + 1]) if i + 1 < len(row) else None
+                if "清醒期平均SpO2 (%)" in cell:
+                    result["清醒期平均SpO2(%)"] = extract_number(row[i + 1]) if i + 1 < len(row) else None
+                if "睡眠期最低血氧 (%)" in cell:
+                    result["睡眠期最低血氧(%)"] = extract_number(row[i + 1]) if i + 1 < len(row) else None
+                if "氧减" in cell and "指数" in cell:
+                    result["氧减＞3%指数(/h)(ODI)"] = extract_number(row[i + 1]) if i + 1 < len(row) else None
+
+            # 处理血氧饱和度水平数据（优化定位逻辑）
+            if row[0].startswith('低于'):
+                key_type = row[0].split(' ')[0]  # 如"低于95%"
+
+                # 统一提取规则：时间取第2列，占比取最后一列
+                if "时间（min）" in row[0]:
+                    # 时间值处理
+                    time_val = row[1] if len(row) > 1 else None
+                    # 占比值处理
+                    percent_val = row[-1] if len(row) > 1 else None
+
+                    # 根据百分比级别存储数据
+                    if "95%" in key_type:
+                        result["血氧饱和度水平低于95%时间(min)"] = convert_time(time_val)
+                        result["血氧饱和度水平低于95%时间占比(%)"] = extract_number(percent_val)
+                    elif "90%" in key_type:
+                        result["血氧饱和度水平低于90%时间(min)"] = convert_time(time_val)
+                        result["血氧饱和度水平低于90%时间占比(%)"] = extract_number(percent_val)
+                    elif "85%" in key_type:
+                        result["血氧饱和度水平低于85%时间(min)"] = convert_time(time_val)
+                        result["血氧饱和度水平低于85%时间占比(%)"] = extract_number(percent_val)
+                    elif "80%" in key_type:
+                        result["血氧饱和度水平低于80%时间(min)"] = convert_time(time_val)
+                        result["血氧饱和度水平低于80%时间占比(%)"] = extract_number(percent_val)
+
         return result
 
     def process_table_data(self,table, table_type):
@@ -348,40 +473,74 @@ class RtfDataParser:
                 elif child.tag.endswith('tbl'):
                     yield child
 
-    # 将doc中的元素存入element中，准备按顺序处理
-    def print_docx_content(self,doc):
-        # 构建元素序列
-        elements = []
-        for element in doc.element.body.iterchildren():
-            if isinstance(element, CT_P):
-                # 通过元素创建段落对象
-                para = Paragraph(element, doc.part)
-                elements.append(('paragraph', para))
-            elif isinstance(element, CT_Tbl):
-                # 通过元素创建表格对象
-                tbl = Table(element, doc.part)
-                elements.append(('table', tbl))
+    def extract_data(self,paragraphs):
+        """从段落数据中提取目标字段"""
+        data = {
+            "AHI(次/h)": None,
+            "OAHI(次/h)": None,
+            "OAI(次/h)": None,
+            "睡眠期间血氧＜90%的累计时间(min)": None,
+            "睡眠期间血氧＜90%的累计时间占比": None,
+            "结论": [],
+            "诊断": []
+        }
 
-        para_number = 0
-        table_number = 0
-        # 按原始顺序处理元素
-        for elem_type, elem_obj in elements:
-            if elem_type == 'paragraph':
-                text = elem_obj.text.strip()
-                para_number +=1
-                if text:
-                    print(f"[段落] {para_number}: {text}")
-            elif elem_type == 'table':
-                table_number += 1
-                print(f"\n[表格] {table_number}")
-                for row in elem_obj.rows:
-                    row_data = [
-                        " ".join(run.text for run in cell.paragraphs[0].runs)
-                        for cell in row.cells
-                    ]
-                    print(" | ".join(row_data))
-                print("-" * 40)
+        # 状态标志
+        in_conclusion = False
+        in_diagnosis = False
 
+        for _, text in paragraphs:
+            text = text.strip()
+            if not text:
+                in_conclusion = False
+                in_diagnosis = False
+                continue
+
+            # 提取数值型数据
+            if "AHI" in text:
+                if match := re.search(r"AHI.*?=([\d.]+)", text):
+                    data["AHI(次/h)"] = float(match.group(1))
+            if match := re.search(r"OAHI.*?=([\d.]+)", text):
+                data["OAHI(次/h)"] = float(match.group(1))
+            if match := re.search(r"OAI.*?=([\d.]+)", text):
+                data["OAI(次/h)"] = float(match.group(1))
+
+            # 血氧数据提取
+            if "血氧<90%" in text or "血氧＜90%" in text:
+                parts = re.split(r"[；;]", text)
+                for part in parts:
+                    if "时间" in part and "min" not in part:  # 处理第三个文档的特殊格式
+                        if match := re.search(r"([\d:\.]+)", part):
+                            data["睡眠期间血氧＜90%的累计时间(min)"] = convert_time(match.group(1))
+                    elif "时间" in part:
+                        if match := re.search(r"([\d.]+)\s*min", part):
+                            data["睡眠期间血氧＜90%的累计时间(min)"] = float(match.group(1))
+                    if "占比" in part:
+                        if match := re.search(r"([\d.]+)%?", part):
+                            data["睡眠期间血氧＜90%的累计时间占比"] = float(match.group(1))
+
+            # 结论和诊断处理
+            if text.startswith("结论："):
+                in_conclusion = True
+                in_diagnosis = False
+                data["结论"].append(text.replace("结论：", "").strip())
+                continue
+            if text.startswith("诊断："):
+                in_diagnosis = True
+                in_conclusion = False
+                data["诊断"].append(text.replace("诊断：", "").strip())
+                continue
+
+            if in_conclusion:
+                data["结论"].append(text)
+            if in_diagnosis:
+                data["诊断"].append(text)
+
+        # 合并文本字段
+        data["结论"] = " ".join(data["结论"]) if data["结论"] else None
+        data["诊断"] = " ".join(data["诊断"]) if data["诊断"] else None
+
+        return data
 
 
     def extract_docx_data(self,docx_path, fields):
@@ -401,6 +560,12 @@ class RtfDataParser:
             else:
                 full_text.append((current_section, text))
 
+        doc_data = self.extract_data(full_text)
+        for field in fields:
+            for key_data in doc_data:
+                if field == key_data:
+                    data[field] = doc_data[key_data]
+
         # 提取所有表格
         tables = []
         for table in doc.tables:
@@ -416,7 +581,7 @@ class RtfDataParser:
                 for key_data in table_data:
                     if field == key_data:
                         data[field] = table_data[key_data]
-            if table_type == tableType.LimbMovements:
+            if table_type == tableType.Null:
                 print(table_type,":\ntable_data:\n",table_data,"\ntable:\n",table)
 
         #print(data)
