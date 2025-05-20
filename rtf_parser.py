@@ -15,6 +15,8 @@ from queue import Queue
 
 # 配置文件路径
 YAML_CONFIG = "MedicalReportParameters.yml"
+
+# YAML_CONFIG = "Info.yml"
 class tableType(enum.Enum):
     Null = enum.auto()
     Info = enum.auto()
@@ -44,6 +46,15 @@ def extract_number(value):
         return float(cleaned)
     except:
         return None
+
+
+def extract_number_from_string(s):
+    match = re.search(r'(\d+\.?\d*)', s)
+    return float(match.group(1)) if match and '.' in match.group(1) else int(match.group(1)) if match else None
+
+def process_gender(s):
+    return 'M' if s.strip().lower() == 'male' else 'F' if s.strip().lower() == 'female' else s
+
 class RTFParser:
     def __init__(self,log_queue,stop_event):
         self.logger = LogManager().get_logger()
@@ -115,34 +126,50 @@ class RTFParser:
         return tableType.Null
 
     def process_info_table(self,table, scan_mode=False):
-        table_data = {}
+        key_map = {
+            '姓名': '姓名',
+            '身高': '身高(cm)',
+            '体重': '体重(kg)',
+            '性别': '性别',
+            '年龄': '年龄',
+            '体重指数(BMI)': '体重指数(BMI)(kg/m2)',
+            '出生日期': '出生日期',
+            '颈围': '颈围(cm)',
+            '腹围': '腹围(cm)',
+            '监测日期': '监测日期',
+            '监测医/技师': '监测医/技师',
+            '转诊医师': '转诊医师'
+        }
+        result = {
+            '姓名': None,
+            '身高(cm)': None,
+            '体重(kg)': None,
+            '性别': None,
+            '年龄': None,
+            '体重指数(BMI)(kg/m2)': None,
+            '出生日期': None,
+            '颈围(cm)': None,
+            '腹围(cm)': None,
+            '监测日期': None,
+            '监测医/技师': None,
+            '转诊医师': None
+        }
+
         for row in table:
-            """处理表格行（支持扫描模式和数据处理模式）"""
-            cell_text = " | ".join(cell.strip() for cell in row)
-            # 使用改进的正则表达式匹配键值对
-            pattern = r'''
-                ([^：]+?)        # 匹配键（非贪婪）
-                \s*：\s*         # 匹配冒号及周围空格
-                ((?:(?!\s*\||\s*$).)*)  # 匹配值（排除分隔符）
-                (?=\s*\|?|\s*$)  # 前瞻断言
-            '''
+            for item in row:
+                key, value = item.split('：', 1)
+                key = key.strip()
+                value = value.strip()
+                if key in key_map:
+                    target_key = key_map[key]
+                    if key in ['身高', '体重', '年龄', '颈围', '腹围', '体重指数(BMI)']:
+                        result[target_key] = extract_number_from_string(value)
+                    elif key == '性别':
+                        result[target_key] = process_gender(value)
+                    else:
+                        result[target_key] = value
 
-            for match in re.finditer(pattern, cell_text, re.X):
-                raw_key, raw_value = match.groups()
-
-                # 标准化键名：删除所有空格但保留符号
-                clean_key = re.sub(r'\s+', '', raw_key)
-                clean_key = re.sub(r'\|', '', clean_key)
-                # 标准化值：保留原始内容仅清理空格
-                clean_value = re.sub(r'\s*', '', raw_value).strip()
-                if scan_mode:
-                    # 扫描模式：注册字段
-                    if clean_key not in table_data:
-                        table_data[clean_key] = None
-                else:
-                    # 数据模式：存储值（最后出现的值会覆盖之前的）
-                    table_data[clean_key] = clean_value
-        return table_data
+        return result
 
     def process_firstorder_table(self,table, scan_mode=False):
         table_data = {}
@@ -156,6 +183,7 @@ class RTFParser:
                 key = key.replace(" ", "").replace("（", "(").replace("）", ")").replace("\t",'')
                 key = key.replace("总卧床时间TIB", "卧床时间(TIB)")
                 key = key.replace("(次/分钟)","")
+                value = extract_number_from_string(value)
 
                 # 转换数值类型（可选）
                 table_data[key] = value
@@ -482,6 +510,7 @@ class RTFParser:
     def extract_data(self,paragraphs):
         """从段落数据中提取目标字段"""
         data = {
+            "监测类型": None,
             "AHI(次/h)": None,
             "OAHI(次/h)": None,
             "OAI(次/h)": None,
@@ -494,6 +523,8 @@ class RTFParser:
         # 状态标志
         in_conclusion = False
         in_diagnosis = False
+        text = paragraphs[2][1].strip()
+        data["监测类型"] = text
 
         for _, text in paragraphs:
             text = text.strip()
@@ -503,6 +534,8 @@ class RTFParser:
                 continue
 
             # 提取数值型数据
+
+
             if "AHI" in text:
                 if match := re.search(r"AHI.*?=([\d.]+)", text):
                     data["AHI(次/h)"] = float(match.group(1))
@@ -572,6 +605,8 @@ class RTFParser:
                 if field == key_data:
                     data[field] = doc_data[key_data]
 
+        debug_msg = f"doc_data: {doc_data},\ndata: {data}"
+        self.logger.debug(debug_msg)
         # 提取所有表格
         tables = []
         for table in doc.tables:
@@ -588,7 +623,7 @@ class RTFParser:
                     if field == key_data:
                         data[field] = table_data[key_data]
             if not table_type == table_type.Null:
-                debug_msg = f"{table_type},:\ntable_data:\n{table_data}\ntable:\n{table}"
+                debug_msg = f"{table_type}:\ntable_data:\n{table_data}\ntable:\n{table}"
                 self.logger.debug("%s", debug_msg)
 
         self.logger.debug(data)
